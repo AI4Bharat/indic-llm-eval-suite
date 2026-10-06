@@ -1,0 +1,2 @@
+{"id": "s1", "question": "A shop sells 12 apples for $3. How much do 40 apples cost?", "answer": "12 apples cost $3, so 1 apple costs 3/12 = $<<3/12=0.25>>0.25.\n40 apples cost 40*0.25 = $<<40*0.25=10>>10.\n#### 10"}
+{"id": "s2", "question": "What is 15% of 240?", "answer": "15% of 240 = 0.15*240 = <<0.15*240=36>>36.\n#### 36"}

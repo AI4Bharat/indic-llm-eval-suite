@@ -1,0 +1,124 @@
+# SWE-bench Verified -- 500 real GitHub issues from 12 Python repositories.
+#
+# Only 'problem_statement' (the issue text a model is asked to fix) is
+# translated. 'patch', 'test_patch', 'FAIL_TO_PASS', 'PASS_TO_PASS',
+# 'base_commit', 'environment_setup_commit' and the rest are the grading
+# harness: they are carried through byte-identical. 'hints_text' is also human
+# prose but is excluded from the standard evaluation, so it is left in English.
+#
+#   test 500 rows x 14 languages = 7,000 requests
+#
+# Issue statements are long and full of code blocks, stack traces, diffs and
+# backslashes: mean ~1,700 chars, p90 ~3,200, max ~24,800 (~7k tokens). This is
+# the benchmark most exposed to the undoubled-JSON-escape failure mode, which
+# translation validation now rejects and retries automatically.
+
+benchmark: swe_bench
+
+source:
+  type: huggingface
+  path: princeton-nlp/SWE-bench_Verified
+  splits: [test]          # this dataset has no configs and only a test split
+  # path: princeton-nlp/SWE-bench_Lite       # 300 instances
+  # path: princeton-nlp/SWE-bench            # the full 2,294-instance set
+  id_field: instance_id   # e.g. "astropy__astropy-12907"; unique, left untouched
+  cache_dir: null
+
+fields:
+  default:
+    - [problem_statement]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: identifiers, paths, tracebacks and Markdown topology
+    # all have to survive character-for-character.
+    temperature: 0.2
+    # Headroom for the longest issues: a 25k-char statement plus an Indic-script
+    # translation plus thinking.
+    max_output_tokens: 65536
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/swe-bench.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/swe-bench.md
+    model: gemini-3.7-flash
+    # The agreed bar is 98. This judge's own rubric calls >=70 as "no major or critical errors" a pass, and
+    # correct_r1 ran at 70; the recorrect pass (correct_r2) then swept
+    # everything still below 98. Pinned to 98 so any future round uses the
+    # current bar rather than the one this benchmark happened to start on.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/swe-bench.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you
+    # spell "correct everything below 98" -- which is the agreed bar. Judge
+    # scores are always integers in practice, and 99 is never emitted, so <=97
+    # and <98 pick exactly the same records. Setting this to 98 would
+    # additionally sweep in the very large 98-scoring bucket.
+    # (correct_r1 on this benchmark ran at 70; correct_r2 raised it to 98.)
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/swe-bench-verified-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98
+  sample_rate: 0.25
+  sample_seed: "swe-bench-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

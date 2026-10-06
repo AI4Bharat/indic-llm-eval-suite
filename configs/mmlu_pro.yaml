@@ -1,0 +1,142 @@
+# MMLU-Pro -- up to 10-option multiple choice across 14 academic subjects.
+#
+# 'question' and 'options' are translated together so the options stay parallel
+# with each other and with the question. 'answer' (a letter) and 'answer_index'
+# index into the option *order*, which the prompt and validation both hold
+# fixed, so the key stays valid without ever being shown to the model.
+# 'cot_content', 'category' and 'src' are carried through untouched.
+#
+# SIZE WARNING -- this is by far the largest benchmark here:
+#   validation     70 rows x 14 =      980 requests   (cheap; run this first)
+#   test       12,032 rows x 14 =  168,448 requests   (~9x GSM8K)
+# Scaled from the measured GSM8K run, the test split alone is roughly $350-450
+# to translate and $200-250 to judge. Do the validation split first, look at the
+# scores, and only then start test.
+
+benchmark: mmlu_pro
+
+source:
+  type: huggingface
+  path: TIGER-Lab/MMLU-Pro
+  splits: [validation, test]      # this dataset has no configs
+  id_field: question_id           # int64, unique; left untouched
+  cache_dir: null
+
+fields:
+  default:
+    - [question, options]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: the options must stay distinct and equally fluent, and
+    # nothing may hint at which one is correct.
+    temperature: 0.2
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/mmlu-pro.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/mmlu-pro.md
+    model: gemini-3.7-flash
+    # The agreed bar is 98. This judge's own rubric calls >=70 as "no major or critical errors" a pass, and
+    # correct_r1 ran at 70; the recorrect pass (correct_r2) then swept
+    # everything still below 98. Pinned to 98 so any future round uses the
+    # current bar rather than the one this benchmark happened to start on.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  # Judging 168k instances on a hosted model is the single biggest line item in
+  # this config. To judge on a self-hosted model behind an OpenAI-compatible
+  # endpoint instead, replace the judge stage above with this:
+  #
+  # judge:
+  #   prompt: ../prompts/judge/mmlu-pro.md
+  #   model: google/gemma-3-27b-it
+  #   pass_threshold: 70
+  #   score_scale: 100
+  #   max_attempts: 2
+  #   inference:
+  #     mode: parallel
+  #     litellm_model: hosted_vllm/google/gemma-3-27b-it
+  #     api_base: http://localhost:8000/v1
+  #     num_workers: 64
+  #     temperature: 0.0
+  #     max_output_tokens: 2048
+  #     json_mode: false          # many local servers reject response_format
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/mmlu-pro.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you
+    # spell "correct everything below 98" -- which is the agreed bar. Judge
+    # scores are always integers in practice, and 99 is never emitted, so <=97
+    # and <98 pick exactly the same records. Setting this to 98 would
+    # additionally sweep in the very large 98-scoring bucket.
+    # (correct_r1 on this benchmark ran at 70; correct_r2 raised it to 98.)
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/mmlu-pro-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98
+  sample_rate: 0.25
+  sample_seed: "mmlu-pro-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output
+  google/gemma-3-27b-it:
+    input_per_1m: 0.0
+    output_per_1m: 0.0

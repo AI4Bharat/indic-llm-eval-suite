@@ -1,0 +1,138 @@
+# Arena-Hard-Auto v2.0 -- 500 hard prompts and 250 creative-writing prompts
+# mined from live Chatbot Arena traffic, scored by an LLM judge against a
+# baseline model's answer.
+#
+# SOURCE IS LOCAL, and has to be. lmarena-ai/arena-hard-auto is a results
+# archive: 324 JSONL files of model answers and judgements, which load_dataset
+# tries to concatenate into one split and fails on. The questions live in
+# data/arena-hard-v2.0/question.jsonl inside that repo, which
+# scripts/prepare_arena_hard.py fetches directly.
+#
+#   python scripts/prepare_arena_hard.py
+#
+# ENGLISH ONLY. v2.0 ships 750 prompts of which only 504 are English -- the
+# other 246 are Chinese (78), Russian (64), Vietnamese (27), Japanese (17),
+# Spanish (15) and twenty-one other languages, inherited from the arena traffic
+# they were mined from. The prep script drops them: the prompts in
+# prompts/{translate,judge,correct}/arena_hard.md are written for an English
+# source throughout, and a Chinese -> Tamil pass is a different job with
+# different failure modes and a different reviewer. `--all-languages` keeps all
+# 750 if that is ever wanted, but the prompts would need rewriting first.
+#
+# ONE FIELD. `prompt` is the entire user-facing request; `uid`, `category`
+# (hard_prompt / creative_writing) and `subcategory` (coding / math /
+# creative_writing) are routing labels the model never sees and that carry
+# through as source columns. There is nothing else in the record.
+#
+# THE PROMPTS ARE MOSTLY PROTECTED CONTENT. The coding subcategory (253 of 504)
+# embeds whole source files, shell sessions and Advent-of-Code problem
+# statements; math (247) is dense LaTeX. The longest prompt is 27,586 characters
+# -- an entire AoC day pasted in -- and the model has to echo every byte of it
+# back. Hence 65536 output tokens, matching swe_bench rather than the 32768 the
+# short-answer benchmarks use.
+#
+#   test 504 rows x 14 languages = 7,056 requests
+
+benchmark: arena_hard
+
+source:
+  type: local
+  id_field: uid                   # 16-hex-char string, unique across the set
+  files:
+    test: ../local_data/arena_hard/test.jsonl
+
+fields:
+  default:
+    # One field, one group. The prompt is a single self-contained user turn.
+    - [prompt]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: code blocks, shell flags, LaTeX, API names and exact
+    # input/output examples all have to survive character-for-character, and an
+    # invented constraint changes what the benchmark is asking for.
+    temperature: 0.2
+    # The longest prompt is 27,586 chars and the response repeats it in full, in
+    # a script that tokenises worse than English. 32768 would truncate the tail.
+    max_output_tokens: 65536
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/arena_hard.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/arena_hard.md
+    model: gemini-3.7-flash
+    # The 98 bar, as everywhere else here. This judge returns both a `verdict`
+    # and a `score`; validate_judgement reads the verdict when it is PASS or
+    # FAIL and falls back to the threshold for NEEDS_REVIEW.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/arena_hard.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/arena-hard-v2-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps the English prompt, uid, category, subcategory
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "arena-hard-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

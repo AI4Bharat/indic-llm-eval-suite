@@ -1,0 +1,148 @@
+# FrontierMath -- research-level mathematics problems with automatically
+# verifiable numeric or symbolic answers.
+#
+# READ THIS FIRST: THIS IS THE PUBLIC SAMPLE, NOT THE BENCHMARK.
+#
+# FrontierMath is not distributable. Epoch AI holds the 338-problem set (295 in
+# Tiers 1-3, 43 in Tier 4 after the June 2026 revision) privately, precisely so
+# it cannot leak into training data. It is on no Hugging Face repo and there is
+# no licensed copy on this machine. What *is* public is the handful of sample
+# problems Epoch publishes at
+#
+#     https://epoch.ai/frontiermath/tiers-1-4/benchmark-problems
+#
+# which scripts/prepare_frontier_math.py scrapes: 12 problems, 2 of them Tier 4,
+# with answers and full worked solutions.
+#
+#   python scripts/prepare_frontier_math.py            # all 12
+#   python scripts/prepare_frontier_math.py --tier 4   # the 2 Tier-4 problems
+#
+# So a run against this config exercises the prompts and the pipeline honestly,
+# on real FrontierMath text, at a scale that proves nothing statistically. If a
+# licensed copy of the full set ever lands, point `source.files` at it and
+# nothing else here has to change -- the prompts key on `problem` alone.
+#
+# ONLY `problem` IS TRANSLATED. `answer` and `solution` are collected so a
+# translated problem can be checked against the same ground truth the English
+# one is graded on, and they ride through as untranslated source columns. They
+# are never sent to the model: a corrector that has seen the answer will quietly
+# make the problem easier. `tier` and `title` are labels.
+#
+# EVERYTHING IS NOTATION. The statements are near-solid LaTeX -- \[ \] display
+# blocks, \( \) and $$ $$ inline, \begin{align*} environments, blackboard and
+# Fraktur commands, Sage and Python listings. Translating the prose while
+# copying the notation byte-for-byte is the whole job, and an undoubled JSON
+# escape inside a LaTeX command is the failure mode `parsing.control_char_error`
+# exists to catch.
+#
+# SOURCE DEFECTS ARE PRESERVED. Two statements have display equations whose
+# LaTeX delimiters are already stripped on Epoch's page -- they read
+# `[x^3y+y^3z+z^3x=0]` and `[B\cdot (A_1,...)]` rather than `\[...\]`. The
+# scraper copies the page verbatim and the prompts forbid repairing a source
+# defect, so those stay as they are on both sides of the translation.
+#
+#   sample 12 rows x 14 languages = 168 requests
+
+benchmark: frontier_math
+
+source:
+  type: local
+  id_field: id                    # e.g. "frontiermath-tier4-elliptic-curves-..."; from the prep script
+  files:
+    sample: ../local_data/frontier_math/sample.jsonl
+
+fields:
+  default:
+    # One field, one group. The answer and the worked solution must never reach
+    # the model -- see the header.
+    - [problem]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately. Lower than most: a quantifier whose scope moves, or a
+    # single altered subscript, changes which object the problem asks for.
+    temperature: 0.1
+    # Problems are short (longest 1,677 chars) but the escaped LaTeX in the JSON
+    # response is far longer than the source text it encodes.
+    max_output_tokens: 16384
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/frontier_math.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/frontier_math.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/frontier_math.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # do NOT push the full set anywhere public
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps the English problem, answer, solution, tier, title
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+# Every row is reviewed here: 12 problems is small enough that spot-checking
+# would be pointless, and research-level mathematics needs a specialist anyway.
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 1.0
+  sample_seed: "frontier-math-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+  csv_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

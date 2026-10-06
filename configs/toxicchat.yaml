@@ -1,0 +1,156 @@
+# ToxicChat -- 5,083 real user turns from a public chatbot demo, each carrying a
+# human toxicity label and a human jailbreak label. It is a moderation
+# benchmark: the task is to classify the user's turn, not to answer it.
+#
+# TEST SPLIT ONLY, of the toxicchat0124 release. 0124 is the newer and cleaner
+# of the two annotation releases; `train` (5,082 rows) exists for fine-tuning
+# guard models and is not what a leaderboard number is reported on. Uncomment it
+# below if you want both halves -- it doubles the bill.
+#
+# ONLY `user_input` IS TRANSLATED. Everything else is either the answer key or
+# stale the moment the text changes:
+#
+#   toxicity           0/1, 362 positives in the test split (7.1%)
+#   jailbreaking       0/1, 91 positives (1.8%)
+#   human_annotation   whether a human or a model assigned the labels
+#   openai_moderation  per-category scores computed on the *English* string;
+#                      carried through unchanged and NOT recomputed, so treat it
+#                      as a property of the source row, not of the translation
+#   model_output       the reply the demo model gave; the moderation task is
+#                      about the user turn, so it stays English and is not sent
+#
+# THE CLASS IMBALANCE IS THE WHOLE RISK. Fewer than one row in ten is a
+# positive, and every one of them is a positive *because of its exact wording*.
+# A translator that euphemizes a slur, clinicalizes an explicit request or
+# tidies a jailbreak template turns a labelled positive into text that no longer
+# matches its label, and nothing downstream can detect it -- the row still has a
+# 1 in the toxicity column. The prompts therefore treat profanity, intensity,
+# explicitness and jailbreak scaffolding as protected content, in the same way
+# other benchmarks here protect LaTeX.
+#
+# RAW USER TEXT, NOT EDITED TEXT. 1,551 of the 5,083 turns are 40 characters or
+# fewer; 371 are multi-line; 18 carry fenced code and many more are pure code,
+# URLs or keyword fragments with nothing to translate; a few hundred are written
+# in Portuguese, Spanish, Polish and other languages rather than English. Typos,
+# missing punctuation and machine-translated phrasing are the data. The Indic
+# risk specific to this benchmark is politeness: the default polite register in
+# most of these languages would by itself sanitize a blunt four-word question
+# that was labelled toxic, so the prompts pin the register explicitly.
+#
+# 17 turns name DAN, 18 say "stay in character", 53 say "pretend", 43 set up
+# role-play. Persona names and literal reply tags such as `[CLASSIC]` /
+# `[JAILBREAK]` stay verbatim in Latin script.
+#
+#   test 5,083 rows x 14 languages = 71,162 requests
+#   (+ train 5,082 rows = another 71,148 if you enable it)
+#
+# Note: lmsys/toxic-chat is CC-BY-NC-4.0 -- non-commercial. Check that against
+# whatever you intend to do with the translated copy before pushing it anywhere.
+
+benchmark: toxicchat
+
+source:
+  type: huggingface
+  path: lmsys/toxic-chat
+  configs:
+    toxicchat0124: [test]         # the 0124 annotation release; add `train` for the other 5,082 rows
+    # toxicchat1123: [test]       # the earlier release, superseded by 0124
+  id_field: conv_id               # a 64-char hash; unique across both splits, left untouched
+  cache_dir: null
+
+fields:
+  default:
+    # One field, one group. Labels, moderation scores and the model reply are
+    # the answer key -- see the header.
+    - [user_input]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: a sampled softer synonym for a slur is exactly the
+    # failure this benchmark cannot survive, and there is no downstream check
+    # that would catch it.
+    temperature: 0.2
+    # Turns top out at 1,536 chars, but jailbreak templates are echoed back in
+    # full and script expansion costs tokens.
+    max_output_tokens: 16384
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/toxicchat.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/toxicchat.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/toxicchat.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/toxic-chat-indic (mind the NC licence)
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps the English turn, both labels, the moderation scores and the reply
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+# The full file is 5,083 rows; a 10% spot check on top of the failures is what
+# fits a human budget here, and the rows that matter most -- the 453 labelled
+# positives -- are the ones worth pulling out by hand from the assembled output.
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.1
+  sample_seed: "toxicchat-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

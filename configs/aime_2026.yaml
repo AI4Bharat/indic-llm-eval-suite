@@ -1,0 +1,115 @@
+# AIME 2026 -- 30 olympiad competition problems (AIME I + II).
+#
+# Only 'problem' is translated. 'answer' is an integer 0-999 and is never
+# touched: it is what a grader compares against. 'problem_idx' is carried
+# through unchanged.
+#
+#   train 30 rows x 14 languages = 420 requests -- the cheapest run in the repo,
+#   and a good one to shake out a new model or service account on.
+
+benchmark: aime_2026
+
+source:
+  type: huggingface
+  path: MathArena/aime_2026
+  splits: [train]         # this dataset has no configs and only a train split
+  id_field: problem_idx   # int64, unique 1-30; left untouched (only generated ids are written back)
+  cache_dir: null
+
+fields:
+  default:
+    - [problem]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: an olympiad statement is a set of exact conditions, and
+    # every LaTeX span has to come back byte-for-byte.
+    temperature: 0.2
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/aime-2026.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/aime-2026.md
+    model: gemini-3.7-flash
+    # The agreed bar is 98. This judge's own rubric calls >=70 as "no major or critical errors" a pass, and
+    # correct_r1 ran at 70; the recorrect pass (correct_r2) then swept
+    # everything still below 98. Pinned to 98 so any future round uses the
+    # current bar rather than the one this benchmark happened to start on.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/aime-2026.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you
+    # spell "correct everything below 98" -- which is the agreed bar. Judge
+    # scores are always integers in practice, and 99 is never emitted, so <=97
+    # and <98 pick exactly the same records. Setting this to 98 would
+    # additionally sweep in the very large 98-scoring bucket.
+    # (correct_r1 on this benchmark ran at 70; correct_r2 raised it to 98.)
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/aime-2026-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98
+  # 30 problems is small enough to check by hand: sample everything.
+  sample_rate: 1.0
+  sample_seed: "aime-2026-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

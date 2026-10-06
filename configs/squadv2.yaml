@@ -1,0 +1,135 @@
+# SQuAD v2 -- extractive reading comprehension with unanswerable questions.
+#
+# The HF schema is  {id, title, context, question, answers{text[], answer_start[]}}.
+# There is no 'is_impossible' column and no 'plausible_answers': a question is
+# unanswerable exactly when 'answers.text' is empty, which is true of 50.1% of
+# the validation split. The dotted selector 'answers.text' translates the answer
+# strings and leaves 'answer_start' alone, the same trick arc_challenge uses for
+# 'choices.text'.
+#
+# ANSWER OFFSETS -- read this before using the output.
+# 'answer_start' is a character offset into the *English* context and is not
+# recomputed here; nothing in the pipeline can translate an integer. The
+# translated example stays usable because the prompts require every translated
+# answer to remain an exact contiguous substring of the translated context, so
+# an offset is recovered downstream with translated_context.find(translated_ans).
+# The official SQuAD v2 metric scores EM/F1 over answer *text*, not offsets, so
+# the standard evaluation path needs no offset at all.
+#
+# 'title' is a Wikipedia article name used for grouping, not for scoring, and is
+# carried through untranslated so it still joins against the English release.
+#
+# REDUNDANCY -- 11,873 questions share only 1,204 distinct contexts, so the
+# passage (mean 811 chars, the bulk of every request) is translated about 10x
+# more often than it strictly must be. That is the single largest line item in
+# this config's cost. See README 'Shared-passage benchmarks' for the trade-off.
+#
+#   validation 11,873 rows x 14 languages = 166,222 requests
+
+benchmark: squadv2
+
+source:
+  type: huggingface
+  path: rajpurkar/squad_v2
+  splits: [validation]            # the 11,873-question eval set; train is 130,319 rows
+  id_field: id                    # 32-hex string, unique across the split; left untouched
+  cache_dir: null
+
+fields:
+  default:
+    # One group, deliberately: an answer has to be a substring of the context,
+    # so the corrector and the judge must see both in the same request.
+    - [context, question, answers.text]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: the answer span has to come back character-for-character
+    # identical to a run of the translated context. Sampling diversity buys
+    # nothing here and breaks substring alignment.
+    temperature: 0.2
+    # Contexts reach 4,063 chars and the model echoes the whole passage back, so
+    # this needs more headroom than the MCQ benchmarks.
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/squadv2.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/squadv2.md
+    model: gemini-3.7-flash
+    # The 98 bar. 'passed' is derived from this because the judge prompt returns
+    # a score without a verdict key.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/squadv2.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- which is the agreed bar. Judge scores are
+    # always integers in practice, and 99 is never emitted, so <=97 and <98 pick
+    # exactly the same records. Setting this to 98 would additionally sweep in
+    # the very large 98-scoring bucket.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/squad-v2-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps English context/answers and answer_start
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "squadv2-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

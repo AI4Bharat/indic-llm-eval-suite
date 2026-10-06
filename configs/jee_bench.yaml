@@ -1,0 +1,136 @@
+# JEE-Bench -- 515 JEE Advanced physics, chemistry and mathematics problems
+# (2016-2023 papers, both sittings).
+#
+# Only 'question' is translated, and it is the whole item: the statement, any
+# LaTeX table or paired list, and -- for the multiple-choice items -- the answer
+# options inline. There is no options column here, unlike every other MCQ in
+# this repo, so option labels live inside the translated string.
+#
+# 'gold' is the answer key and is NEVER translated or shown to the model: it is
+# a letter string ('A', 'BD', 'ABD') or a bare number ('9', '0.75', '-14.6'),
+# and grading matches it against labels and quantities inside the translated
+# text. That is why the prompts treat ASCII A/B/C/D, the (I)-(IV)/(P)-(T)
+# paired-list labels, the option count and the requested unit as protected
+# content: a label rendered in Devanagari or Tamil digits breaks grading
+# outright, with nothing downstream able to notice.
+#
+# 'type' is carried through but deliberately NOT shown to the model. It marks
+# each item as MCQ (110, exactly one correct), MCQ(multiple) (186, one or more
+# correct), Integer (82) or Numeric (137). Handing the translator the label
+# would tell it how many options are correct -- so instead the prompts require
+# the source's own hedging ("is/are", "statement(s)") to survive at the same
+# strength, which is both the faithful behaviour and the one that keeps the
+# distinction. 'subject', 'description' and 'index' are carried through too.
+#
+#   test 515 rows x 14 languages = 7,210 requests
+#
+# Note on ids: 'index' is the question number within a paper, not a key -- only
+# 54 distinct values across 515 rows -- so it cannot be the id_field. There is
+# no id column, so the pipeline writes a deterministic content-derived UUID into
+# 'id'. 'description' + 'index' remain in the output for human traceability back
+# to "JEE Adv 2019 Paper 1, Q37".
+
+benchmark: jee_bench
+
+source:
+  type: huggingface
+  path: daman1209arora/jeebench
+  splits: [test]          # this dataset has no configs, only a test split
+  id_field: id            # absent from the dataset -> generated (see note above)
+  cache_dir: null
+
+fields:
+  default:
+    - [question]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: 494 of the 515 items are mostly LaTeX, and every
+    # command, brace, digit and option label has to come back character for
+    # character. Sampling diversity buys nothing and costs fidelity.
+    temperature: 0.2
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/jee-bench.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/jee-bench.md
+    model: gemini-3.7-flash
+    # The agreed bar: 98. Unlike the GPQA judge this prompt was derived from,
+    # this one emits no 'verdict' string, so the score alone decides -- there is
+    # no way for a "PASS" label to disagree with the threshold.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/jee-bench.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you
+    # spell "correct everything below 98" -- which is the agreed bar. Judge
+    # scores are always integers in practice, and 99 is never emitted, so <=97
+    # and <98 pick exactly the same records. Setting this to 98 would
+    # additionally sweep in the very large 98-scoring bucket.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/jeebench-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98
+  sample_rate: 0.25
+  sample_seed: "jee-bench-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

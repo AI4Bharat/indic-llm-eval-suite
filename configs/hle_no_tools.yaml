@@ -1,0 +1,146 @@
+# Humanity's Last Exam, no-tools text-only configuration -- 2,158 closed-ended
+# expert questions answered with no web, no code execution and no image.
+#
+# SOURCE IS LOCAL because of a filter. cais/hle is one 2,500-row split holding
+# both text and multi-modal questions, with no config that separates them.
+# scripts/prepare_hle_no_tools.py keeps the 2,158 rows whose `image` is empty --
+# HLE's own marker for a text-only question -- and drops the 342 that are not.
+# A question whose statement refers to a figure we are not carrying is
+# unanswerable, so translating it would be producing a broken example.
+#
+#   python scripts/prepare_hle_no_tools.py
+#
+# cais/hle IS GATED. HF_TOKEN must belong to an account that has accepted the
+# terms at https://huggingface.co/datasets/cais/hle, or the prep script gets a
+# 403. The token in .env has.
+#
+# ONLY `question` IS TRANSLATED. `answer` stays English and rides through as a
+# source column, because that is what grading compares against: for the 1,645
+# exactMatch questions it is a literal string, number, formula or name matched
+# by an equality check, and for the 513 multipleChoice questions it is a bare
+# option letter. Translating either would break grading outright. `rationale`
+# is the answer's worked justification and would leak the answer, so it is
+# carried untranslated and never shown to the model.
+#
+# THE OPTIONS LIVE INSIDE THE QUESTION. There is no choices column: a
+# multipleChoice question ends with an "Answer Choices:" block and A./B./C.
+# markers inline. The markers are the answer key -- `answer` is "D" -- so they
+# have to survive in Latin script, in order, with the same option attached to
+# each. That contract is stated in all three prompts.
+#
+# MANY QUESTIONS DO NOT SURVIVE TRANSLATION CLEANLY, and that is expected rather
+# than a defect to engineer around. HLE is full of questions whose object is
+# English itself -- take the third letter of a word, Rot13 a letter, wordplay,
+# spelling, quoted source text. The prompts' task-object rule keeps those
+# payloads verbatim; the human-review queue is where the residue gets caught.
+#
+# Math is 976 of the 2,158 rows, so this is the most LaTeX-dense benchmark here
+# after frontier_math.
+#
+#   test 2,158 rows x 14 languages = 30,212 requests
+#
+# Keep `canary`. It is how HLE detects training contamination and it should
+# travel with any derived copy -- same rule this repo already applies to GPQA.
+
+benchmark: hle_no_tools
+
+source:
+  type: local
+  id_field: id                    # 24-hex-char string; unique, left untouched
+  files:
+    test: ../local_data/hle_no_tools/test.jsonl
+
+fields:
+  default:
+    # One field, one group. Options are inline in the question, and the answer
+    # must not be translated -- see the header.
+    - [question]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: a single reworded condition, a dropped unit or a
+    # reordered option changes the answer to a question whose answer is checked
+    # by exact match.
+    temperature: 0.2
+    # The longest question is 21,137 chars (a Rust listing to be compiled in the
+    # head) and the response repeats it in full, in a script that tokenises
+    # worse than English.
+    max_output_tokens: 65536
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/hle_no_tools.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/hle_no_tools.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/hle_no_tools.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/hle-no-tools-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps the English question, answer, answer_type, rationale, canary
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "hle-no-tools-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

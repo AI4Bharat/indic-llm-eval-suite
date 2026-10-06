@@ -1,0 +1,134 @@
+# AlpacaEval -- 805 open-ended instructions, scored by win rate against a
+# baseline model's answer.
+#
+# SOURCE IS LOCAL, and has to be. tatsu-lab/alpaca_eval is a loading-script
+# dataset, and datasets 4.x removed script execution: load_dataset raises
+# "Dataset scripts are no longer supported". The data is a plain JSON array in
+# the same repo, which scripts/prepare_alpaca_eval.py downloads directly.
+#
+#   python scripts/prepare_alpaca_eval.py
+#
+# INSTRUCTION ONLY. The record is {dataset, instruction, output, generator}.
+# `output` is the *baseline* answer the judge compares a model against
+# (text_davinci_003 for AlpacaEval 1.0, gpt4_1106_preview for 2.0), not a
+# reference the instruction author wrote. It stays English and rides through as
+# a source column: a Hindi answer is judged against the English baseline, which
+# is the agreed scope. Translating the baseline too is a real option -- it would
+# make the comparison like-for-like -- but it is roughly ten times the output
+# tokens, and it changes what the leaderboard number means.
+#
+# NOTE: upstream AlpacaEval records sometimes carry a separate `input` field
+# that the evaluator concatenates after the instruction. The released 805-row
+# set does not: every row is instruction-only, verified against the file. The
+# prompts therefore say nothing about `input`.
+#
+# NO ID COLUMN. AlpacaEval is matched positionally -- the leaderboard pairs a
+# model's output to the reference by list order. The prep script assigns
+# `id` = "<sub-dataset>-<zero-padded position>" and keeps `position`, so the
+# original order is pinned and recoverable rather than hidden behind a UUID.
+#
+# Instructions are short: mean 164 chars, longest 1,917. This is the cheapest
+# benchmark in the repo per row.
+#
+#   eval 805 rows x 14 languages = 11,270 requests
+
+benchmark: alpaca_eval
+
+source:
+  type: local
+  id_field: id                    # e.g. "helpful_base-0000"; assigned by the prep script
+  files:
+    eval: ../local_data/alpaca_eval/eval.jsonl
+
+fields:
+  default:
+    # One field, one group. The instruction is the whole evaluation prompt.
+    - [instruction]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: these are instructions, and a translation that
+    # resolves an ambiguity or tightens a vague request changes the task.
+    temperature: 0.2
+    # Instructions are short (longest 1,917 chars), but the selfinstruct and
+    # koala subsets embed code, tables and exact output formats that have to be
+    # echoed verbatim.
+    max_output_tokens: 16384
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/alpaca_eval.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/alpaca_eval.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/alpaca_eval.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/alpaca-eval-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps the English instruction, baseline output, generator, dataset
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "alpaca-eval-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

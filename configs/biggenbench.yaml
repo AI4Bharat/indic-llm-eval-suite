@@ -1,0 +1,141 @@
+# BiGGen-Bench -- 765 free-form generation instances across nine capabilities,
+# each scored 1-5 by an LLM judge against an instance-specific rubric and a
+# score-5 reference answer.
+#
+# SOURCE IS LOCAL because of a filter, not a loader problem.
+# prometheus-eval/BiGGen-Bench reads fine from the Hub; what it cannot do is
+# drop the 70 instances whose capability is `multilingual`. Those are written in
+# Korean and are *about* the language they are written in -- one of the seven
+# tasks under that capability, `robust_translation`, asks the model to translate
+# a Korean idiom into English. Translating such an input into Hindi does not
+# make a Hindi version of the task, it destroys the task. Removing them leaves
+# 695 instances, which is exactly the set ai4bharat/biggenbench was built from.
+#
+#   python scripts/prepare_biggenbench.py
+#
+# ONLY `input` IS TRANSLATED, which is a deliberate three-part decision:
+#
+#   - `system_prompt` stays English by instruction. It is short (mean 124 chars)
+#     and mostly role-setting boilerplate; leaving it fixed keeps the system
+#     turn identical across all 14 languages so only the task varies.
+#   - `reference_answer` stays English. It is the score-5 exemplar the judge
+#     reads. Keeping one reference across languages keeps scores comparable;
+#     translating it would make style and fluency judgements language-relative.
+#   - `score_rubric` stays English, for the same reason and more strongly: a
+#     rubric that drifts across 14 translations stops measuring one thing.
+#
+# All four ride through as source columns, so nothing is lost -- `score_rubric`
+# is flattened by the prep script into `score_rubric_criteria` and
+# `score_rubric_score<N>_description` so the rubric levels are readable columns
+# rather than one JSON blob. If you later want the reference or rubric
+# translated too, add them to `fields` and extend the three prompts; they are
+# written today for a single `input` field.
+#
+# THE INPUT IS OFTEN THE TASK OBJECT. `refinement` instances carry a prior draft
+# to revise, `grounding` carries source documents, `instruction_following`
+# carries text to edit, and several tasks embed rhymes, spelling examples and
+# word puzzles that only work in English. The translate prompt's task-object
+# rule is the one that matters most on this benchmark.
+#
+#   test 695 rows x 14 languages = 9,730 requests
+
+benchmark: biggenbench
+
+source:
+  type: local
+  id_field: id                    # e.g. "planning_travel_plan_0"; unique, left untouched
+  files:
+    test: ../local_data/biggenbench/test.jsonl
+
+fields:
+  default:
+    # One field, one group. The system prompt, reference answer and rubric are
+    # deliberately not translated -- see the header.
+    - [input]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: an input that becomes clearer, more specific or more
+    # answerable than the English is no longer the instance the rubric scores.
+    temperature: 0.2
+    # Inputs reach 10,383 chars (grounding instances carry whole source
+    # documents) and are echoed back in full.
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/biggenbench.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/biggenbench.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/biggenbench.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/biggen-bench-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps system_prompt, reference_answer and the flattened rubric
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "biggenbench-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

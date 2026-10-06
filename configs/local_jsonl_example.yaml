@@ -1,0 +1,65 @@
+# Reading a benchmark from local JSONL files instead of the Hub, and running
+# everything through LiteLLM parallel inference instead of batch mode.
+#
+# This is also the shape to use when someone hands you translated files to
+# judge: point `source.files` at whatever you have locally.
+
+benchmark: my_benchmark
+
+source:
+  type: local
+  id_field: id
+  files:
+    # {split: path}, or {config: {split: path}} for multi-config datasets
+    test: ../local_data/my_benchmark/test.jsonl
+    validation: ../local_data/my_benchmark/validation.jsonl
+
+fields:
+  # Per-split overrides are looked up as "config/split", then split, then
+  # config, then default.
+  default:
+    - [question, answer]
+  validation:
+    - [question]
+
+languages: [Hindi, Bengali, Tamil]
+language_codes:
+  Hindi: hi
+  Bengali: bn
+  Tamil: ta
+
+stages:
+  translate:
+    prompt: ../prompts/translate/generic.md
+    model: gemini-2.5-flash
+    max_attempts: 3
+    inference:
+      mode: parallel
+      litellm_model: vertex_ai/gemini-2.5-flash
+      num_workers: 32
+      temperature: 0.2
+      json_mode: true
+
+  judge:
+    prompt: ../prompts/judge/generic.md
+    model: gemini-2.5-pro
+    pass_threshold: 7
+    inference:
+      mode: parallel
+      litellm_model: vertex_ai/gemini-2.5-pro
+      num_workers: 16
+      temperature: 0.0
+
+  correct:
+    prompt: ../prompts/correct/generic.md
+    model: gemini-2.5-pro
+    inference:
+      mode: parallel
+      litellm_model: vertex_ai/gemini-2.5-pro
+      num_workers: 16
+      temperature: 0.3
+
+output:
+  root: ../data
+  destination: local
+  column_template: "{field}_{code}"

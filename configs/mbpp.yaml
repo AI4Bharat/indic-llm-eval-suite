@@ -1,0 +1,123 @@
+# MBPP -- Mostly Basic Python Problems.
+#
+# Only 'text' (the natural-language task statement) is translated. 'code',
+# 'test_list', 'test_setup_code' and 'challenge_test_list' are Python and are
+# carried through byte-identical -- translating any of them would break every
+# test that grades a solution.
+#
+#   test 500 rows x 14 languages = 7,000 requests
+#
+# 'task_id' is an int32 and is deliberately NOT used as id_field: the pipeline
+# writes generated ids back into their column, and turning task_id into a string
+# would change the benchmark's schema. A UUID goes into a new 'id' column
+# instead, and task_id survives untouched for anything that joins on it.
+
+benchmark: mbpp
+
+source:
+  type: huggingface
+  path: google-research-datasets/mbpp
+  configs:
+    full: [test]          # the standard 500-problem eval split
+    # full: [test, validation, train, prompt]   # +474 rows across three splits
+    # 'sanitized' is a different, smaller config with a 'prompt' column instead
+    # of 'text' -- it needs its own fields entry, so keep it in its own config file
+  id_field: id            # absent from MBPP, so a deterministic UUID is written here
+  cache_dir: null
+
+fields:
+  default:
+    - [text]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: identifiers, literals and operators inside the task
+    # text have to come back character-for-character.
+    temperature: 0.2
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/mbpp.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/mbpp.md
+    model: gemini-3.7-flash
+    # The agreed bar is 98. This judge's own rubric calls >=70 as "no major or critical errors" a pass, and
+    # correct_r1 ran at 70; the recorrect pass (correct_r2) then swept
+    # everything still below 98. Pinned to 98 so any future round uses the
+    # current bar rather than the one this benchmark happened to start on.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/mbpp.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you
+    # spell "correct everything below 98" -- which is the agreed bar. Judge
+    # scores are always integers in practice, and 99 is never emitted, so <=97
+    # and <98 pick exactly the same records. Setting this to 98 would
+    # additionally sweep in the very large 98-scoring bucket.
+    # (correct_r1 on this benchmark ran at 70; correct_r2 raised it to 98.)
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/mbpp-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98
+  sample_rate: 0.25
+  sample_seed: "mbpp-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

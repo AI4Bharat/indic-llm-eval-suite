@@ -1,0 +1,134 @@
+# DROP -- discrete reasoning over paragraphs (counting, arithmetic, sorting).
+#
+# The HF schema is {section_id, query_id, passage, question,
+# answers_spans{spans[], types[]}}. This is the flattened release: there is no
+# 'number'/'date'/'validated_answers' structure from the original DROP json.
+# The dotted selector 'answers_spans.spans' translates the answer strings and
+# leaves 'answers_spans.types' alone.
+#
+# ANSWER SPANS ARE MOSTLY NOT TEXT. Across the validation split the 'types'
+# column labels 13,942 answers 'number', 9,633 'span' and 331 'date' -- so 60%
+# of answers are numerals like "3" or "24-17" that must survive verbatim, and
+# translating one into a Devanagari digit or a spelled-out word silently breaks
+# the example. The model is not shown 'types' (it is metadata, not prose), so
+# the prompts key off the span's own form instead: anything purely numeric or
+# date-like is copied character-for-character. Only 'span'-typed answers are
+# genuinely translated, and those must stay exact substrings of the translated
+# passage or question.
+#
+# 'query_id' has exactly one duplicate in the validation split; attach_row_ids
+# disambiguates it as '<id>#1' rather than merging the two rows.
+#
+# REDUNDANCY -- 9,535 questions share only 579 distinct passages, so the passage
+# (mean 1,047 chars, the bulk of every request) is translated about 16x more
+# often than it strictly must be. This is the largest line item in this config's
+# cost, more so than for squadv2. See README 'Shared-passage benchmarks'.
+#
+#   validation 9,535 rows x 14 languages = 133,490 requests
+
+benchmark: drop
+
+source:
+  type: huggingface
+  path: ucinlp/drop
+  splits: [validation]            # the 9,535-question eval set; train is 77,400 rows
+  id_field: query_id              # uuid string; one duplicate, disambiguated automatically
+  cache_dir: null
+
+fields:
+  default:
+    # One group: a span answer has to be a substring of the passage or question,
+    # so the model must see all three together.
+    - [passage, question, answers_spans.spans]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: every score, yardage, count and date in the passage has
+    # to survive as ASCII, and span answers must stay substrings of it.
+    temperature: 0.2
+    # Passages reach 5,511 chars and the model echoes the whole passage back --
+    # the longest source text of any benchmark here except swe_bench.
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/drop.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/drop.md
+    model: gemini-3.7-flash
+    # The 98 bar. 'passed' is derived from this because the judge prompt returns
+    # a score without a verdict key.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/drop.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- which is the agreed bar. Judge scores are
+    # always integers in practice, and 99 is never emitted, so <=97 and <98 pick
+    # exactly the same records. Setting this to 98 would additionally sweep in
+    # the very large 98-scoring bucket.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/drop-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps English passage/question and the typed answer spans
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "drop-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

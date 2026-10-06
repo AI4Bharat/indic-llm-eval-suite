@@ -1,0 +1,158 @@
+# HarmBench -- 400 red-teaming behaviors, scored by attack success rate: each
+# behavior is sent to the model under test and a HarmBench classifier decides
+# whether the completion actually exhibits it.
+#
+# THREE CONFIGS, THREE SHAPES. walledai/HarmBench mirrors the official
+# harmbench_behaviors_text_all.csv, split by functional category:
+#
+#   standard    200 rows  {prompt, category}
+#   contextual  100 rows  {prompt, context, category}
+#   copyright   100 rows  {prompt, tags}
+#
+# so `fields` is keyed by config name rather than using one `default` group.
+# Field-group lookup tries <config>/<split>, then <split>, then <config>, then
+# `default`; only the three config keys are defined, so a fourth config showing
+# up upstream fails loudly instead of being translated with the wrong group.
+#
+# CONTEXTUAL TRANSLATES prompt AND context IN ONE GROUP, and it has to. 84 of
+# the 100 behaviors point into the document -- "these instructions", "the
+# following email", "the OP", "this section" -- and several ask about one
+# specific detail inside it ("explain how big the stream of nitrogen gas should
+# be"). Split across two requests the pointer stops resolving and a dropped
+# clause makes the item unanswerable, with nothing downstream able to notice.
+# The contexts are real documents: 79 prose, 11 Markdown, 8 numbered procedures,
+# 2 code, up to 3,544 chars, including emails with headers and signatures,
+# forum threads marked `**OP:**`, encyclopedia sections and paper abstracts.
+#
+# COPYRIGHT IS GRADED BY HASH, which is worth knowing before you use it. The 50
+# lyrics and 50 book behaviors are checked by hashing the completion against the
+# original *English* work, so a model that answers a Hindi prompt with a Hindi
+# rendering of the lyrics scores as a refusal even though it complied. The
+# prompts therefore keep the title and author verbatim in Latin script and keep
+# the request aimed at the work's own text, which is also the faithful reading
+# of the English. If you would rather not carry that artifact at all, comment
+# the `copyright` config out here and its group below -- nothing else changes.
+#
+# `category` (6 semantic categories) and `tags` are routing labels, carried
+# through but never sent: handing the translator "chemical_biological" tells it
+# what the behavior is before it reads it.
+#
+#   standard 200 + contextual 100 + copyright 100 = 400 rows x 14 languages
+#   = 5,600 requests
+#
+# Note on ids: the mirror drops the official BehaviorID, so there is no id
+# column and the pipeline writes a deterministic content-derived UUID into `id`.
+# The behavior text is the key the official grader matches on anyway, and it is
+# kept as a source column, so rows stay traceable.
+#
+# Note on access: walledai/HarmBench is gated (auto-approve) -- HF_TOKEN must
+# have accepted its terms, which the token in .env already has.
+
+benchmark: harmbench
+
+source:
+  type: huggingface
+  path: walledai/HarmBench
+  configs:
+    standard: [train]             # 200 behaviors, no context
+    contextual: [train]           # 100 behaviors, each with its document
+    copyright: [train]            # 100 hash-checked behaviors -- see the header
+  id_field: id                    # absent from the dataset -> generated (see note above)
+  cache_dir: null
+
+fields:
+  standard:
+    - [prompt]
+  contextual:
+    # One group, deliberately: the behavior points into the document.
+    - [prompt, context]
+  copyright:
+    - [prompt]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: every qualifier is graded -- "at home", "without
+    # specialized tools", "without getting caught" -- and a sampled paraphrase
+    # that drops one turns a behavior into a weaker behavior.
+    temperature: 0.2
+    # Contexts reach 3,544 chars and are echoed back in full alongside the
+    # behavior, in a script that costs more tokens than English.
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/harmbench.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/harmbench.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/harmbench.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/harmbench-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps the English behavior, context, category and tags
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "harmbench-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

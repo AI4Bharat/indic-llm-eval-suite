@@ -1,0 +1,131 @@
+# GPQA Diamond -- 198 graduate-level biology, chemistry and physics MCQs.
+#
+# Unlike every other MCQ here, GPQA does not store options as a list: the four
+# choices are four separate columns, and the correct one is named 'Correct
+# Answer'. The field names contain spaces, which the pipeline passes through
+# unchanged -- so the prompts name exactly these keys, and the output columns
+# come out as "Correct Answer_Hindi" and so on.
+#
+# The column name is the answer key. The model never sees which is which: it is
+# handed all five fields as one JSON object with no ordering signal, and the
+# prompt forbids marking, privileging or polishing any option. Answer neutrality
+# is what the judge's 'answer_leakage' category exists to catch.
+#
+# 'Explanation', the validator metadata and 'Canary String' are carried through
+# untouched. Keep the canary: it is how GPQA detects training contamination, and
+# it should travel with any derived copy.
+#
+#   gpqa_diamond train 198 rows x 14 languages = 2,772 requests
+#
+# Note: Idavidrein/gpqa is a gated dataset -- HF_TOKEN must have accepted its
+# terms, which the token in .env already has.
+
+benchmark: gpqa
+
+source:
+  type: huggingface
+  path: Idavidrein/gpqa
+  configs:
+    gpqa_diamond: [train]         # the standard 198-question eval set
+    # gpqa_main: [train]          # 448 questions
+    # gpqa_extended: [train]      # 546 questions
+  id_field: Record ID             # e.g. "rec06pnAkLOr2t2mp"; unique, left untouched
+  cache_dir: null
+
+fields:
+  default:
+    - [Question, Correct Answer, Incorrect Answer 1, Incorrect Answer 2, Incorrect Answer 3]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: chemical formulae, isotope and charge notation, units
+    # and significant figures all have to survive character-for-character, and
+    # the four options must stay equally polished.
+    temperature: 0.2
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/gpqa.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/gpqa.md
+    model: gemini-3.7-flash
+    # The agreed bar is 98. This judge's own rubric calls 90-100 a pass, and
+    # correct_r1 ran at 75; the recorrect pass (correct_r2) then swept
+    # everything still below 98. Pinned to 98 so any future round uses the
+    # current bar rather than the one this benchmark happened to start on.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/gpqa.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you
+    # spell "correct everything below 98" -- which is the agreed bar. Judge
+    # scores are always integers in practice, and 99 is never emitted, so <=97
+    # and <98 pick exactly the same records. Setting this to 98 would
+    # additionally sweep in the very large 98-scoring bucket.
+    # (correct_r1 on this benchmark ran at 75; correct_r2 raised it to 98.)
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/gpqa-diamond-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98
+  sample_rate: 0.25
+  sample_seed: "gpqa-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

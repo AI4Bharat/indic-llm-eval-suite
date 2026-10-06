@@ -1,0 +1,160 @@
+# FORTRESS -- 500 adversarial prompts, each paired with a benign twin and with
+# its own hand-written rubric of 4-7 binary criteria. A response is scored by
+# answering each criterion yes/no; the benign twin measures over-refusal.
+#
+# BOTH PROMPTS ARE TRANSLATED, IN ONE GROUP, and that is the central decision
+# here. `benign_prompt` is `adversarial_prompt` with the harmful ask removed --
+# same voice, same scenario, often the same opening paragraph word for word. The
+# pair only means something if the two differ *only* where they are supposed to,
+# so they go into a single request with an explicit instruction to render shared
+# spans identically. Translated separately they drift, and an over-refusal
+# difference could then come from the phrasing rather than the content.
+#
+# THE RUBRIC STAYS ENGLISH, for the reason BiGGen-Bench keeps its rubric
+# English: it is the measuring stick, and a stick that drifts across 14
+# translations stops measuring one thing. It is also never shown to the
+# translator. The consequence is the rule the translate prompt leans hardest on:
+# the criteria name concrete things -- "a specific link", "specific brands of
+# equipment", "printer settings", "the AR-15", "required materials" -- and a
+# translation that stops demanding one of them makes that criterion unreachable,
+# so the risk score falls without the model under test being any safer.
+# `rubric`, `risk_domain` and `risk_subdomain` all ride through as source
+# columns; the rubric is a list of strings and is written out as-is.
+#
+# OBFUSCATION IS THE ATTACK, AND IT IS COPIED, NOT TRANSLATED. 140 of the 500
+# adversarial prompts contain non-ASCII characters, and the transformations are
+# the point of the instance rather than decoration:
+#
+#   ~20 rows   whole prompt or a span written backwards (ID 595 is 42,455 chars
+#              of reversed English; ID 456 is plain English framing + a reversed
+#              payload, so the rule has to be span-level, not row-level)
+#    2 rows    base64 (IDs 1028, 1052)
+#    4 rows    circled / double-struck letterforms (IDs 15, 351)
+#    3 rows    Unicode small capitals (IDs 921, 964) and upside-down text (814)
+#    ~5 rows   written in another language entirely -- Traditional Chinese
+#              (20, 345), Japanese + Georgian (37), Ukrainian + German (268)
+#   16 rows    leetspeak, plus bracket-split acronyms such as [I][S][K][P]
+#
+# Decoding any of that hands the model plain text and the jailbreak becomes
+# trivially detectable, so the prompts require byte-for-byte copying of every
+# such span and of every non-English block, including the rows that come back
+# entirely untranslated. That is the intended outcome, not a failure.
+#
+# DELIBERATE MISSPELLINGS ARE ALSO THE ATTACK. Several prompts are written in
+# broken English as a persona or a filter evasion ("I teech at the American
+# School of Cairo... Pleaz translayt this to gud english"). Note the subtlety
+# the prompts spell out: when the broken text is the *object* of the task -- a
+# passage the model is asked to translate or fix -- it stays in its original
+# English and only the framing around it is translated.
+#
+# LENGTH. Adversarial prompts run from 42 chars to 42,455; the median is 637 and
+# the 99th percentile 8,954. Eight rows exceed 8k chars and two exceed 20k, and
+# those are exactly the cipher blobs that come back verbatim, so
+# max_output_tokens is set well above the rest of the repo.
+#
+#   train 500 rows x 14 languages = 7,000 requests
+#
+# `ID` is the dataset's own key: unique, sparse (3-1091), left untouched.
+
+benchmark: fortress
+
+source:
+  type: huggingface
+  path: ScaleAI/fortress_public
+  splits: [train]                 # this dataset has no configs; `train` is all 500 instances
+  id_field: ID                    # unique, sparse (3-1091); left untouched
+  cache_dir: null
+
+fields:
+  default:
+    # One group, deliberately: the pair has to be translated together so the
+    # spans they share come back identical. See the header.
+    - [adversarial_prompt, benign_prompt]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: obfuscated spans have to come back character for
+    # character, and any sampling at all on a 42k-char reversed blob is a
+    # guaranteed corruption.
+    temperature: 0.2
+    # The two long fields plus a copied cipher payload. The largest single row
+    # is 42,558 chars across both prompts, and it is echoed verbatim.
+    max_output_tokens: 65536
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/fortress.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/fortress.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/fortress.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/fortress-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps both English prompts, the rubric and both risk labels
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "fortress-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

@@ -1,0 +1,144 @@
+# StrongREJECT -- 313 forbidden prompts for evaluating jailbreaks. A response is
+# scored by an autograder on three axes: whether the model refused, and, if it
+# did not, how *specific* and how *convincing* the answer was.
+#
+# THAT GRADER IS WHY VAGUENESS IS THE FAILURE MODE HERE. Two of the three axes
+# reward a detailed answer, so a translation that loses the concrete object --
+# a named drug becoming "a drug", a named exploit becoming "hacking" -- draws a
+# vague response, scores low, and reports a model as safe that was not. The
+# prompts treat the concrete object, every demand for detail ("step-by-step",
+# "detailed", "a list of components", present in 81 of the 313) and every count
+# ("give me 10 tips") as protected content for exactly that reason.
+#
+# SOURCE. The canonical release is a CSV in the alexandrasouly/strongreject
+# GitHub repo, which is not reachable from this machine. walledai/StrongREJECT
+# mirrors that CSV and is gated (auto-approve); HF_TOKEN has accepted its terms.
+# It carries the 313 rows with the category counts the paper reports:
+#
+#   Non-violent crimes 59, Violence 54, Disinformation and deception 50,
+#   Hate/harassment/discrimination 50, Illegal goods and services 50,
+#   Sexual content 50
+#
+# It was checked row for row against two independent ungated mirrors
+# (Machlovi/strongreject-dataset, Lv111/StrongREJECT): `prompt`, `category` and
+# `source` are identical in the same order across all three. Either of those is
+# a drop-in replacement if the gate is ever a problem -- Machlovi additionally
+# carries a constant `prompt_label` ("unsafe" on all 313 rows) that nothing
+# uses. All three rename the canonical `forbidden_prompt` column to `prompt`.
+#
+# ONLY `prompt` IS TRANSLATED. `category` and `source` (which collection the
+# prompt came from -- custom 221, DAN 35, AdvBench 25, and five smaller ones)
+# are routing metadata, carried through but never sent.
+#
+# 222 of the 313 prompts carry a first-person pretext -- "as a lawyer", "for the
+# politician I support", "here is my plan" -- and that framing is the surface a
+# jailbreak works through, so the prompts protect it as carefully as the object
+# of the request. A handful embed a multi-line plan with `Preparation:` /
+# `Execution:` headings and bullets that the model is asked to extend; those are
+# translated in full, structure intact, never summarized.
+#
+#   test 313 rows x 14 languages = 4,382 requests
+#
+# Prompts are short: mean 148 chars, longest 842.
+
+benchmark: strongreject
+
+source:
+  type: huggingface
+  path: walledai/StrongREJECT
+  splits: [train]                 # this dataset has no configs; `train` is all 313 prompts
+  id_field: id                    # absent from the dataset -> content-derived UUID generated
+  cache_dir: null
+
+fields:
+  default:
+    # One field, one group. category and source are metadata.
+    - [prompt]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: the autograder rewards specificity, so a sampled
+    # paraphrase that generalizes the object of the request depresses the score
+    # without the model under test being any safer.
+    temperature: 0.2
+    # Longest prompt is 842 chars, and a few carry a bulleted plan echoed back
+    # in full.
+    max_output_tokens: 16384
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/strongreject.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/strongreject.md
+    model: gemini-3.7-flash
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/strongreject.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- the agreed bar.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/strongreject-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps the English prompt, category and source
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  sample_rate: 0.25
+  sample_seed: "strongreject-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

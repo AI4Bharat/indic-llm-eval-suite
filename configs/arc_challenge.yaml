@@ -1,0 +1,118 @@
+# ARC-Challenge -- grade-school multiple-choice science questions.
+#
+# 'choices' is a struct of {text: [...], label: [...]}. Only the option text is
+# translated, so 'answerKey' -- which indexes into the *labels* -- stays valid
+# and the answer never has to be inferred. The dotted selector 'choices.text'
+# reaches the model (and comes back) under the flattened key 'choices_text',
+# which is the key the prompts name.
+#
+#   test 1,172 rows x 14 languages = 16,408 requests
+
+benchmark: arc_challenge
+
+source:
+  type: huggingface
+  path: allenai/ai2_arc
+  configs:
+    ARC-Challenge: [test]
+    # ARC-Challenge: [test, validation]   # +299 rows (4,186 more requests)
+  id_field: id            # ai2_arc has its own string id; it is left untouched
+  cache_dir: null
+
+fields:
+  default:
+    - [question, choices.text]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: the whole task is fidelity -- digits, formulae and the
+    # distinctness of the four options. GSM8K ran at 0.9 and produced a small
+    # tail of altered digits; there is nothing here that sampling diversity buys.
+    temperature: 0.2
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/arc_challenge.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/arc_challenge.md
+    model: gemini-3.7-flash
+    # The agreed bar is 98. This judge's own rubric calls >=70 as "no major or critical errors" a pass, and
+    # correct_r1 ran at 70; the recorrect pass (correct_r2) then swept
+    # everything still below 98. Pinned to 98 so any future round uses the
+    # current bar rather than the one this benchmark happened to start on.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/arc_challenge.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you
+    # spell "correct everything below 98" -- which is the agreed bar. Judge
+    # scores are always integers in practice, and 99 is never emitted, so <=97
+    # and <98 pick exactly the same records. Setting this to 98 would
+    # additionally sweep in the very large 98-scoring bucket.
+    # (correct_r1 on this benchmark ran at 70; correct_r2 raised it to 98.)
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/arc-challenge-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98
+  sample_rate: 0.25
+  sample_seed: "arc-challenge-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output

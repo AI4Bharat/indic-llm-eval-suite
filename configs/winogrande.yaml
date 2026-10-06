@@ -1,0 +1,134 @@
+# WinoGrande -- binary fill-in-the-blank pronoun/reference resolution.
+#
+# Schema is {sentence, option1, option2, answer}. 'sentence' contains exactly
+# one ASCII underscore marking the blank (true for all 1,267 validation rows),
+# and 'answer' is the string "1" or "2" naming the correct option by position.
+# Only the three text fields are translated; 'answer' indexes into option
+# *order*, which the prompts and validation both hold fixed, so the key stays
+# correct without ever being shown to the model.
+#
+# This is the hardest benchmark here to translate without destroying, and the
+# difficulty is grammatical rather than lexical. Both options must remain
+# insertable into the blank, and Indic morphology leaks the answer far more
+# readily than English does: gender and number agreement on the verb, case and
+# postposition selection, honorific level, and animacy-sensitive constructions
+# can each make one option ungrammatical and hand the reader the answer. The
+# prompts spend most of their length on exactly this, and 'answer_leakage' is
+# the judge category that catches it.
+#
+# The test split is unlabelled (every 'answer' is the empty string), so
+# validation is the only usable evaluation split.
+#
+#   winogrande_xl validation 1,267 rows x 14 languages = 17,738 requests
+
+benchmark: winogrande
+
+source:
+  type: huggingface
+  path: allenai/winogrande
+  configs:
+    winogrande_xl: [validation]   # 1,267 labelled rows; test is unlabelled
+    # winogrande_xl: [train]      # 40,398 rows -- training data, not an eval set
+  id_field: id                    # WinoGrande has no id column, so a deterministic UUID is written here
+  cache_dir: null
+
+fields:
+  default:
+    # One group: the two options only make sense against the sentence they slot
+    # into, so the model must see all three together to keep them balanced.
+    - [sentence, option1, option2]
+
+languages:
+  Assamese: as
+  Bengali: bn
+  Gujarati: gu
+  Hindi: hi
+  Kannada: kn
+  Malayalam: ml
+  Marathi: mr
+  Nepali: ne
+  Odia: or
+  Punjabi: pa
+  Sanskrit: sa
+  Tamil: ta
+  Telugu: te
+  Urdu: ur
+
+# Defaults inherited by every stage; each stage can override any of them.
+stage_defaults: &stage_defaults
+  inference:
+    mode: batch
+    # Low, deliberately: the blank must survive verbatim and the two options
+    # must stay grammatically symmetric. Sampling diversity only adds ways to
+    # leak the answer.
+    temperature: 0.2
+    # Sentences average 101 chars and top out at 174, so this is generous.
+    max_output_tokens: 32768
+    json_mode: true
+    max_requests_per_batch: 50000
+    poll_interval_seconds: 30
+  max_attempts: 3
+  # Anything still failing after the batch attempts is finished in parallel
+  # mode. Set enabled: false to leave it in failures.jsonl instead.
+  fallback: &fallback
+    enabled: true
+    max_attempts: 2
+    num_workers: 32
+
+stages:
+  translate:
+    <<: *stage_defaults
+    prompt: ../prompts/translate/winogrande.md
+    model: gemini-3.7-flash
+
+  judge:
+    <<: *stage_defaults
+    prompt: ../prompts/judge/winogrande.md
+    model: gemini-3.7-flash
+    # The 98 bar. 'passed' is derived from this because the judge prompt returns
+    # a score without a verdict key.
+    pass_threshold: 98
+    score_scale: 100
+    max_attempts: 2
+
+  correct:
+    <<: *stage_defaults
+    prompt: ../prompts/correct/winogrande.md
+    model: gemini-3.7-flash
+    max_attempts: 2
+    # NOTE: stage_correct selects on 'score <= max_score', so 97 is how you spell
+    # "correct everything below 98" -- which is the agreed bar. Judge scores are
+    # always integers in practice, and 99 is never emitted, so <=97 and <98 pick
+    # exactly the same records. Setting this to 98 would additionally sweep in
+    # the very large 98-scoring bucket.
+    max_score: 97
+
+output:
+  root: ../data
+  destination: local              # or: huggingface
+  hub_repo: null                  # e.g. your-org/winogrande-indic
+  private: true
+  column_template: "{field}_{language}"
+  keep_source_columns: true       # keeps English sentence/options and the answer key
+  include_quality_columns: false
+  format: jsonl
+
+# stage 5: the flat, one-row-per-instance file handed to human reviewers
+review:
+  fail_threshold: 98              # queues score < 98; matches the correction bar
+  # Higher than the 0.25 used elsewhere: this is a small split, answer leakage is
+  # subtle enough that a judge can miss it, and 1,267 rows makes a heavy sample
+  # affordable.
+  sample_rate: 0.5
+  sample_seed: "winogrande-human-review-v1"
+  csv: true
+  include_judge_details: true
+  include_all_rows: true
+
+# Prices for anything the built-in table does not know about (USD per 1M tokens).
+# Interactive rates -- batch jobs are billed at 50% of these, and the report
+# applies that discount itself from the mode each request ran in.
+pricing:
+  gemini-3.7-flash:
+    input_per_1m: 0.75
+    output_per_1m: 3.75           # reasoning/thinking tokens are billed as output
