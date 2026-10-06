@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# run outputs
+data/
+logs/
+
+# credentials -- never commit
+.env
+.env.*
+!.env.example
+service_account.json
+*service-account*.json
+*-credentials.json
+
+# benchmark data materialised by scripts/prepare_*.py -- regenerable in one
+# command, and some of it must not be redistributed (cais/hle is gated and
+# FrontierMath is not distributable).
+# local_data/my_benchmark is the checked-in example for the local-source config.
+local_data/*
+!local_data/my_benchmark/

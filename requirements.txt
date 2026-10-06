@@ -1,0 +1,18 @@
+# core
+pyyaml>=6.0
+tqdm>=4.66
+
+# Vertex AI: batch prediction jobs and the GCS staging bucket
+google-genai>=1.0.0
+google-cloud-storage>=2.14.0
+google-auth>=2.30.0
+
+# parallel mode: Vertex AI, OpenAI, vLLM, Ollama, ...
+litellm>=1.60.0
+
+# datasets
+datasets>=3.0.0
+huggingface-hub>=0.25.0
+
+# optional
+python-dotenv>=1.0.0     # load credentials from .env
